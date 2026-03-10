@@ -221,18 +221,21 @@ async function main() {
   await server.connect(transport);
   log(`MCP server running. Logs: ${LOG_FILE}`);
 
-  // Start file watcher for auto-indexing
-  const watcher = new ConversationWatcher(db);
-  watcher.start();
-
   // Do initial index in background (don't block the server)
+  // Start the watcher AFTER initial indexing to avoid races
+  const watcher = new ConversationWatcher(db);
+
   log("Starting background indexing...");
   db.indexAll(false)
     .then((stats) => {
       log(`Background indexing complete: ${stats.added} chunks from ${stats.processed} conversations`);
+      // Now start the watcher for incremental updates
+      watcher.start();
     })
     .catch((error) => {
       logError("Background indexing failed", error);
+      // Start watcher anyway so new conversations get indexed
+      watcher.start();
     });
 }
 

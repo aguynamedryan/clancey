@@ -43,6 +43,9 @@ export class ConversationWatcher {
     // Only care about .jsonl files
     if (!filePath.endsWith(".jsonl")) return;
 
+    // Skip if already being indexed
+    if (this.db.isIndexing(filePath)) return;
+
     // Debounce: wait for writes to settle
     const existing = this.debounceTimers.get(filePath);
     if (existing) {
@@ -51,6 +54,9 @@ export class ConversationWatcher {
 
     const timer = setTimeout(async () => {
       this.debounceTimers.delete(filePath);
+
+      // Re-check after debounce - may have been picked up by indexAll
+      if (this.db.isIndexing(filePath)) return;
 
       log(`Re-indexing ${path.basename(filePath)}...`);
 

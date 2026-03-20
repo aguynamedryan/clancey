@@ -3,6 +3,7 @@ import { getConversationWatchDirs } from "./parser.js";
 import { ConversationDB } from "./db.js";
 import { log, logError } from "./logger.js";
 import path from "path";
+import fs from "fs";
 
 export class ConversationWatcher {
   private db: ConversationDB;
@@ -57,6 +58,15 @@ export class ConversationWatcher {
 
       // Re-check after debounce - may have been picked up by indexAll
       if (this.db.isIndexing(filePath)) return;
+
+      // Check mtime — skip if file hasn't changed since last index
+      try {
+        const stat = await fs.promises.stat(filePath);
+        const lastIndexed = this.db.getLastIndexedMtime(filePath);
+        if (lastIndexed !== undefined && lastIndexed >= stat.mtimeMs) return;
+      } catch {
+        return; // File may have been deleted
+      }
 
       log(`Re-indexing ${path.basename(filePath)}...`);
 

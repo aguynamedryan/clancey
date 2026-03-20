@@ -183,6 +183,10 @@ export class ConversationDB {
     return this.indexingInProgress.has(filePath);
   }
 
+  getLastIndexedMtime(filePath: string): number | undefined {
+    return this.indexedFiles.get(filePath);
+  }
+
   async indexAll(force: boolean = false): Promise<IndexStats> {
     if (!this.db) throw new Error("Database not initialized");
 
@@ -227,12 +231,18 @@ export class ConversationDB {
       try {
         const conversation = await parseConversation(filePath);
         if (!conversation) {
+          // Save mtime so we don't reprocess this file every startup
+          const postStat = await fs.promises.stat(filePath);
+          this.indexedFiles.set(filePath, postStat.mtimeMs);
           processed++;
           continue;
         }
 
         const chunks = chunkConversation(conversation);
         if (chunks.length === 0) {
+          // Save mtime so we don't reprocess this file every startup
+          const postStat = await fs.promises.stat(filePath);
+          this.indexedFiles.set(filePath, postStat.mtimeMs);
           processed++;
           continue;
         }
@@ -276,6 +286,9 @@ export class ConversationDB {
       }
     }
 
+    // Save metadata for any empty/null files that were skipped
+    await this.saveIndexedFiles();
+
     // Compact after bulk indexing
     await this.maybeCompact();
 
@@ -291,16 +304,33 @@ export class ConversationDB {
       return { processed: 0, added: 0 };
     }
 
+    // Skip if file hasn't changed since last index
+    try {
+      const stat = await fs.promises.stat(filePath);
+      const lastIndexed = this.indexedFiles.get(filePath);
+      if (lastIndexed !== undefined && lastIndexed >= stat.mtimeMs) {
+        return { processed: 0, added: 0 };
+      }
+    } catch {
+      return { processed: 0, added: 0 };
+    }
+
     this.indexingInProgress.add(filePath);
 
     try {
       const conversation = await parseConversation(filePath);
       if (!conversation) {
+        // Save mtime so watcher doesn't retry this file
+        const postStat = await fs.promises.stat(filePath);
+        this.indexedFiles.set(filePath, postStat.mtimeMs);
         return { processed: 1, added: 0 };
       }
 
       const chunks = chunkConversation(conversation);
       if (chunks.length === 0) {
+        // Save mtime so watcher doesn't retry this file
+        const postStat = await fs.promises.stat(filePath);
+        this.indexedFiles.set(filePath, postStat.mtimeMs);
         return { processed: 1, added: 0 };
       }
 

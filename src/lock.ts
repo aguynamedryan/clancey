@@ -46,7 +46,10 @@ export function tryAcquireIndexerLock(): boolean {
   };
 
   const registerCleanup = () => {
+    let cleaned = false;
     const exitHandler = () => {
+      if (cleaned) return;
+      cleaned = true;
       for (const cb of onExitCallbacks) {
         try { cb(); } catch {}
       }

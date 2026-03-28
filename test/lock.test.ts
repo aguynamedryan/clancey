@@ -21,6 +21,19 @@ function cleanupLock() {
   } catch {}
 }
 
+function spawnWorker(script: string): ReturnType<typeof Bun.spawn> {
+  const tmpScript = path.join(os.tmpdir(), `clancey-test-${Date.now()}-${Math.random().toString(36).slice(2)}.ts`);
+  fs.writeFileSync(tmpScript, script);
+  const proc = Bun.spawn(["bun", "run", tmpScript], {
+    cwd: path.join(import.meta.dir, ".."),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  // Clean up script after process exits
+  proc.exited.then(() => { try { fs.unlinkSync(tmpScript); } catch {} });
+  return proc;
+}
+
 describe("tryAcquireIndexerLock", () => {
   beforeEach(() => cleanupLock());
   afterAll(() => cleanupLock());
@@ -63,5 +76,33 @@ describe("tryAcquireIndexerLock", () => {
 
     expect(acquired).toBe(1);
     expect(notAcquired).toBe(count - 1);
+  });
+});
+
+describe("onIndexerExit", () => {
+  beforeEach(() => cleanupLock());
+  afterAll(() => cleanupLock());
+
+  test("callbacks fire exactly once on SIGINT", async () => {
+    // Write callback invocation count to a temp file so we can read it
+    // after the process exits (stdout timing is unreliable with exit events).
+    const countFile = path.join(os.tmpdir(), `clancey-exit-count-${Date.now()}`);
+    const srcDir = path.resolve(import.meta.dir, "../src");
+    const proc = spawnWorker(`
+      import { tryAcquireIndexerLock, onIndexerExit } from "${srcDir}/lock.ts";
+      import fs from "fs";
+      let count = 0;
+      tryAcquireIndexerLock();
+      onIndexerExit(() => {
+        count++;
+        fs.writeFileSync("${countFile}", String(count));
+      });
+      process.kill(process.pid, "SIGINT");
+    `);
+
+    await proc.exited;
+    const count = parseInt(fs.readFileSync(countFile, "utf-8").trim(), 10);
+    fs.unlinkSync(countFile);
+    expect(count).toBe(1);
   });
 });

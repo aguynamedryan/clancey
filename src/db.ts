@@ -115,6 +115,7 @@ export class ConversationDB {
   private indexingInProgress: Set<string> = new Set(); // files currently being indexed
   private writesSinceCompaction: number = 0;
   private readonly COMPACT_EVERY_N_WRITES = 50;
+  private indexAllInProgress: boolean = false;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
@@ -138,6 +139,18 @@ export class ConversationDB {
     }
 
     log(`Database initialized at ${this.dbPath}`);
+  }
+
+  /** Lazily resolve the conversations table, discovering it if created externally. */
+  private async ensureTable(): Promise<lancedb.Table | null> {
+    if (this.table) return this.table;
+    if (!this.db) return null;
+
+    const tables = await this.db.tableNames();
+    if (tables.includes(TABLE_NAME)) {
+      this.table = await this.db.openTable(TABLE_NAME);
+    }
+    return this.table;
   }
 
   private async loadIndexedFiles(): Promise<void> {
@@ -203,7 +216,17 @@ export class ConversationDB {
 
   async indexAll(force: boolean = false): Promise<IndexStats> {
     if (!this.db) throw new Error("Database not initialized");
+    if (this.indexAllInProgress) throw new Error("Indexing already in progress");
 
+    this.indexAllInProgress = true;
+    try {
+      return await this._indexAllInner(force);
+    } finally {
+      this.indexAllInProgress = false;
+    }
+  }
+
+  private async _indexAllInner(force: boolean): Promise<IndexStats> {
     const files = await listConversationFiles();
     let processed = 0;
     let added = 0;
@@ -275,13 +298,13 @@ export class ConversationDB {
         }));
 
         // Save to database immediately
-        const tables = await this.db.tableNames();
+        const tables = await this.db!.tableNames();
         if (tables.includes(TABLE_NAME)) {
           // Delete existing chunks from this session before adding new ones
           await this.table!.delete(buildSessionDeleteFilter(conversation.sessionId));
           await this.table!.add(records);
         } else {
-          this.table = await this.db.createTable(TABLE_NAME, records);
+          this.table = await this.db!.createTable(TABLE_NAME, records);
         }
 
         // Save the CURRENT mtime (not the pre-parse one) to avoid re-indexing
@@ -381,7 +404,8 @@ export class ConversationDB {
   }
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
-    if (!this.table) {
+    const table = await this.ensureTable();
+    if (!table) {
       return [];
     }
 
@@ -389,28 +413,29 @@ export class ConversationDB {
 
     const queryVector = await embedOne(query);
 
-    // Get more results for filtering
-    let searchQuery = this.table.vectorSearch(queryVector).limit(limit * 4);
+    let searchQuery = table.vectorSearch(queryVector).limit(limit);
+
+    // Build WHERE clause for pre-filtering
+    const filters: string[] = [];
+
+    if (project) {
+      filters.push(`project = '${escapeSqlStringLiteral(project)}'`);
+    }
+
+    if (dateRange) {
+      const range = parseDateRange(dateRange);
+      if (range) {
+        filters.push(`timestamp >= '${range.start.toISOString()}' AND timestamp <= '${range.end.toISOString()}'`);
+      }
+    }
+
+    if (filters.length > 0) {
+      searchQuery = searchQuery.where(filters.join(" AND "));
+    }
 
     const results = await searchQuery.toArray();
 
     let filtered = results;
-
-    // Filter by project
-    if (project) {
-      filtered = filtered.filter((r) => (r.project as string).includes(project));
-    }
-
-    // Filter by date range
-    if (dateRange) {
-      const range = parseDateRange(dateRange);
-      if (range) {
-        filtered = filtered.filter((r) => {
-          const ts = new Date(r.timestamp as string);
-          return ts >= range.start && ts <= range.end;
-        });
-      }
-    }
 
     // Sort by recency if requested
     if (sortBy === "recency") {
@@ -431,7 +456,8 @@ export class ConversationDB {
   }
 
   async getStatus(): Promise<IndexStatus> {
-    if (!this.table) {
+    const table = await this.ensureTable();
+    if (!table) {
       return {
         totalChunks: 0,
         projects: 0,
@@ -439,20 +465,17 @@ export class ConversationDB {
       };
     }
 
-    const totalChunks = await this.table.countRows();
+    const totalChunks = await table.countRows();
 
-    const projectRows = await this.table
+    const rows = await table
       .query()
-      .select(["project"])
+      .select(["project", "timestamp"])
       .toArray();
-    const projects = new Set(projectRows.map((r) => r.project as string));
 
-    const timestampRows = await this.table
-      .query()
-      .select(["timestamp"])
-      .toArray();
+    const projects = new Set<string>();
     let lastUpdated: string | null = null;
-    for (const row of timestampRows) {
+    for (const row of rows) {
+      projects.add(row.project as string);
       const ts = row.timestamp as string;
       if (!lastUpdated || ts > lastUpdated) {
         lastUpdated = ts;

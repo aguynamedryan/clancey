@@ -58,6 +58,113 @@ describe("getStatus", () => {
   });
 });
 
+describe("indexAll single-flight", () => {
+  test("rejects concurrent indexAll() call", async () => {
+    // Access private field to simulate an in-progress indexAll
+    const db = new ConversationDB("/tmp/clancey-single-flight.lance") as unknown as {
+      db: object;
+      indexAllInProgress: boolean;
+      indexAll: (force: boolean) => Promise<{ processed: number; added: number }>;
+    };
+    db.db = {}; // non-null so the "not initialized" check passes
+    db.indexAllInProgress = true;
+
+    await expect(db.indexAll(false)).rejects.toThrow(/already in progress/i);
+  });
+});
+
+describe("search", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clancey-search-test-"));
+  const dbPath = path.join(tmpDir, "search.lance");
+  const dim = 384;
+
+  afterAll(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("project filter returns results even when they are not in the top vector matches", async () => {
+    const conn = await lancedb.connect(dbPath);
+
+    // Create 30 records for "common-project" with vectors near the origin,
+    // and 5 records for "rare-project" with vectors far from origin.
+    // A vector search for a near-origin query will rank common-project first.
+    const records = [];
+    for (let i = 0; i < 30; i++) {
+      const vec = new Array(dim).fill(0);
+      vec[0] = 0.01 * i; // close to origin
+      records.push({
+        id: `common-${i}`,
+        sessionId: `s-common-${i}`,
+        project: "common-project",
+        content: `common content ${i}`,
+        timestamp: "2026-01-01T00:00:00Z",
+        chunkIndex: 0,
+        vector: vec,
+      });
+    }
+    for (let i = 0; i < 5; i++) {
+      const vec = new Array(dim).fill(0);
+      vec[0] = 100 + i; // far from origin
+      records.push({
+        id: `rare-${i}`,
+        sessionId: `s-rare-${i}`,
+        project: "rare-project",
+        content: `rare content ${i}`,
+        timestamp: "2026-01-01T00:00:00Z",
+        chunkIndex: 0,
+        vector: vec,
+      });
+    }
+
+    await conn.createTable("conversations", records, { mode: "overwrite" });
+
+    const db = new ConversationDB(dbPath);
+    await db.init();
+
+    // Search with limit=5 filtering for "rare-project".
+    // With post-filter on limit*4=20, all 20 nearest are from common-project,
+    // so rare-project results would be lost. With pre-filter via where(), they should appear.
+    const results = await db.search("test query", {
+      limit: 5,
+      project: "rare-project",
+    });
+
+    expect(results.length).toBe(5);
+    for (const r of results) {
+      expect(r.project).toBe("rare-project");
+    }
+  });
+});
+
+describe("late table discovery", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clancey-late-table-"));
+  const dbPath = path.join(tmpDir, "late.lance");
+  const dim = 384;
+
+  afterAll(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("getStatus finds table created after init()", async () => {
+    // Init with no table — this.table will be null
+    const db = new ConversationDB(dbPath);
+    await db.init();
+
+    const before = await db.getStatus();
+    expect(before.totalChunks).toBe(0);
+
+    // Another "instance" creates the table
+    const conn = await lancedb.connect(dbPath);
+    await conn.createTable("conversations", [
+      { id: "1", sessionId: "s1", project: "p1", content: "hi", timestamp: "2026-01-01T00:00:00Z", chunkIndex: 0, vector: new Array(dim).fill(0) },
+    ], { mode: "overwrite" });
+
+    // getStatus should now discover the table
+    const after = await db.getStatus();
+    expect(after.totalChunks).toBe(1);
+  });
+});
+
 describe("buildMetadataFileDeleteFilter", () => {
   test("escapes single quotes in file paths", () => {
     expect(buildMetadataFileDeleteFilter("/tmp/a'b.jsonl")).toBe(`"filePath" = '/tmp/a''b.jsonl'`);

@@ -33,7 +33,6 @@ export class ConversationWatcher {
       ignored: (watchedPath, stats) =>
         !stats?.isDirectory() && path.basename(watchedPath).startsWith("."),
       persistent: true,
-      ignoreInitial: true,
       awaitWriteFinish: {
         stabilityThreshold: 2000, // Wait 2s after last write
         pollInterval: 100,

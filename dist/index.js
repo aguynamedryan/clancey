@@ -21021,6 +21021,18 @@ function parseDateRange(dateRange) {
 }
 var TABLE_NAME = "conversations";
 var METADATA_TABLE = "metadata";
+function escapeSqlStringLiteral(value) {
+  return value.replace(/'/g, "''");
+}
+function buildEqualityFilter(column, value) {
+  return `"${column}" = '${escapeSqlStringLiteral(value)}'`;
+}
+function buildSessionDeleteFilter(sessionId) {
+  return buildEqualityFilter("sessionId", sessionId);
+}
+function buildMetadataFileDeleteFilter(filePath) {
+  return buildEqualityFilter("filePath", filePath);
+}
 var ConversationDB = class {
   dbPath;
   db = null;
@@ -21058,21 +21070,19 @@ var ConversationDB = class {
       }
     }
   }
-  async saveIndexedFiles() {
+  async saveIndexedFile(filePath, lastModified) {
     if (!this.db) return;
-    const records = Array.from(this.indexedFiles.entries()).map(([filePath, lastModified]) => ({
+    const record2 = {
       filePath,
       lastModified
-    }));
+    };
     const tables = await this.db.tableNames();
     if (tables.includes(METADATA_TABLE)) {
       const metaTable = await this.db.openTable(METADATA_TABLE);
-      await metaTable.delete("true");
-      if (records.length > 0) {
-        await metaTable.add(records);
-      }
-    } else if (records.length > 0) {
-      await this.db.createTable(METADATA_TABLE, records);
+      await metaTable.delete(buildMetadataFileDeleteFilter(filePath));
+      await metaTable.add([record2]);
+    } else {
+      await this.db.createTable(METADATA_TABLE, [record2]);
     }
     this.writesSinceCompaction++;
     if (this.writesSinceCompaction >= this.COMPACT_EVERY_N_WRITES) {
@@ -21132,6 +21142,7 @@ var ConversationDB = class {
         if (!conversation) {
           const postStat2 = await fs2.promises.stat(filePath);
           this.indexedFiles.set(filePath, postStat2.mtimeMs);
+          await this.saveIndexedFile(filePath, postStat2.mtimeMs);
           processed++;
           continue;
         }
@@ -21139,6 +21150,7 @@ var ConversationDB = class {
         if (chunks.length === 0) {
           const postStat2 = await fs2.promises.stat(filePath);
           this.indexedFiles.set(filePath, postStat2.mtimeMs);
+          await this.saveIndexedFile(filePath, postStat2.mtimeMs);
           processed++;
           continue;
         }
@@ -21151,14 +21163,14 @@ var ConversationDB = class {
         }));
         const tables = await this.db.tableNames();
         if (tables.includes(TABLE_NAME)) {
-          await this.table.delete(`"sessionId" = '${conversation.sessionId}'`);
+          await this.table.delete(buildSessionDeleteFilter(conversation.sessionId));
           await this.table.add(records);
         } else {
           this.table = await this.db.createTable(TABLE_NAME, records);
         }
         const postStat = await fs2.promises.stat(filePath);
         this.indexedFiles.set(filePath, postStat.mtimeMs);
-        await this.saveIndexedFiles();
+        await this.saveIndexedFile(filePath, postStat.mtimeMs);
         processed++;
         added += records.length;
         log(`[${i + 1}/${filesToIndex.length}] Saved ${records.length} chunks`);
@@ -21169,7 +21181,6 @@ var ConversationDB = class {
         this.indexingInProgress.delete(filePath);
       }
     }
-    await this.saveIndexedFiles();
     await this.maybeCompact();
     return { processed, added };
   }
@@ -21194,12 +21205,14 @@ var ConversationDB = class {
       if (!conversation) {
         const postStat2 = await fs2.promises.stat(filePath);
         this.indexedFiles.set(filePath, postStat2.mtimeMs);
+        await this.saveIndexedFile(filePath, postStat2.mtimeMs);
         return { processed: 1, added: 0 };
       }
       const chunks = chunkConversation(conversation);
       if (chunks.length === 0) {
         const postStat2 = await fs2.promises.stat(filePath);
         this.indexedFiles.set(filePath, postStat2.mtimeMs);
+        await this.saveIndexedFile(filePath, postStat2.mtimeMs);
         return { processed: 1, added: 0 };
       }
       const texts = chunks.map((c) => c.content);
@@ -21210,14 +21223,14 @@ var ConversationDB = class {
       }));
       const tables = await this.db.tableNames();
       if (tables.includes(TABLE_NAME)) {
-        await this.table.delete(`"sessionId" = '${conversation.sessionId}'`);
+        await this.table.delete(buildSessionDeleteFilter(conversation.sessionId));
         await this.table.add(records);
       } else {
         this.table = await this.db.createTable(TABLE_NAME, records);
       }
       const postStat = await fs2.promises.stat(filePath);
       this.indexedFiles.set(filePath, postStat.mtimeMs);
-      await this.saveIndexedFiles();
+      await this.saveIndexedFile(filePath, postStat.mtimeMs);
       return { processed: 1, added: records.length };
     } catch (error2) {
       logError(`Error indexing ${filePath}`, error2);
@@ -21270,17 +21283,19 @@ var ConversationDB = class {
         lastUpdated: null
       };
     }
-    const rows = await this.table.query().toArray();
-    const projects = new Set(rows.map((r) => r.project));
+    const totalChunks = await this.table.countRows();
+    const projectRows = await this.table.query().select(["project"]).toArray();
+    const projects = new Set(projectRows.map((r) => r.project));
+    const timestampRows = await this.table.query().select(["timestamp"]).toArray();
     let lastUpdated = null;
-    for (const row of rows) {
+    for (const row of timestampRows) {
       const ts = row.timestamp;
       if (!lastUpdated || ts > lastUpdated) {
         lastUpdated = ts;
       }
     }
     return {
-      totalChunks: rows.length,
+      totalChunks,
       projects: projects.size,
       lastUpdated
     };
@@ -23097,6 +23112,14 @@ var ConversationWatcher = class {
   }
 };
 
+// src/indexer-ownership.ts
+function getIndexerOwnershipError(isIndexerInstance2) {
+  if (isIndexerInstance2) {
+    return null;
+  }
+  return "This instance is search-only; another instance owns indexing.";
+}
+
 // src/lock.ts
 import fs4 from "fs";
 import path4 from "path";
@@ -23110,6 +23133,10 @@ function isProcessAlive(pid) {
   } catch {
     return false;
   }
+}
+var onExitCallbacks = [];
+function onIndexerExit(callback) {
+  onExitCallbacks.push(callback);
 }
 function tryAcquireIndexerLock() {
   try {
@@ -23125,19 +23152,31 @@ function tryAcquireIndexerLock() {
     } catch {
     }
   };
+  const registerCleanup = () => {
+    const exitHandler = () => {
+      for (const cb of onExitCallbacks) {
+        try {
+          cb();
+        } catch {
+        }
+      }
+      cleanup();
+    };
+    process.on("exit", exitHandler);
+    process.on("SIGINT", () => {
+      exitHandler();
+      process.exit(0);
+    });
+    process.on("SIGTERM", () => {
+      exitHandler();
+      process.exit(0);
+    });
+  };
   const acquire = () => {
     fs4.writeFileSync(LOCK_FILE, `${process.pid}
 `, { flag: "wx" });
     log(`Acquired indexer lock (PID ${process.pid})`);
-    process.on("exit", cleanup);
-    process.on("SIGINT", () => {
-      cleanup();
-      process.exit(0);
-    });
-    process.on("SIGTERM", () => {
-      cleanup();
-      process.exit(0);
-    });
+    registerCleanup();
     return true;
   };
   try {
@@ -23156,8 +23195,21 @@ function tryAcquireIndexerLock() {
         return false;
       }
       log(`Removing stale lock from PID ${pid}`);
-      fs4.unlinkSync(LOCK_FILE);
-      return acquire();
+      const tmpFile = `${LOCK_FILE}.${process.pid}`;
+      fs4.writeFileSync(tmpFile, `${process.pid}
+`);
+      fs4.renameSync(tmpFile, LOCK_FILE);
+      const start = Date.now();
+      while (Date.now() - start < 50) {
+      }
+      const winner = parseInt(fs4.readFileSync(LOCK_FILE, "utf-8").trim(), 10);
+      if (winner !== process.pid) {
+        log(`Lost lock race to PID ${winner}. This instance will be search-only.`);
+        return false;
+      }
+      log(`Acquired indexer lock (PID ${process.pid})`);
+      registerCleanup();
+      return true;
     } catch (staleLockError) {
       log(`Failed to recover stale lock file: ${staleLockError}`);
       return false;
@@ -23170,6 +23222,7 @@ import path5 from "path";
 import os3 from "os";
 import fs5 from "fs";
 var db = new ConversationDB(path5.join(os3.homedir(), ".clancey", "conversations.lance"));
+var isIndexerInstance = false;
 function getServerVersion() {
   try {
     const packageJsonPath = new URL("../package.json", import.meta.url);
@@ -23301,6 +23354,13 @@ ${r.content}
     }
     case "index_conversations": {
       const force = args?.force || false;
+      const ownershipError = getIndexerOwnershipError(isIndexerInstance);
+      if (ownershipError) {
+        return {
+          content: [{ type: "text", text: ownershipError }],
+          isError: true
+        };
+      }
       try {
         const stats = await db.indexAll(force);
         return {
@@ -23361,9 +23421,10 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log(`MCP server running. Logs: ${LOG_FILE}`);
-  const isIndexer = tryAcquireIndexerLock();
-  if (isIndexer) {
+  isIndexerInstance = tryAcquireIndexerLock();
+  if (isIndexerInstance) {
     const watcher = new ConversationWatcher(db);
+    onIndexerExit(() => watcher.stop());
     log("Starting background indexing...");
     db.indexAll(false).then((stats) => {
       log(`Background indexing complete: ${stats.added} chunks from ${stats.processed} conversations`);

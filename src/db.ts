@@ -91,6 +91,22 @@ interface IndexStats {
 const TABLE_NAME = "conversations";
 const METADATA_TABLE = "metadata";
 
+function escapeSqlStringLiteral(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+function buildEqualityFilter(column: string, value: string): string {
+  return `"${column}" = '${escapeSqlStringLiteral(value)}'`;
+}
+
+export function buildSessionDeleteFilter(sessionId: string): string {
+  return buildEqualityFilter("sessionId", sessionId);
+}
+
+export function buildMetadataFileDeleteFilter(filePath: string): string {
+  return buildEqualityFilter("filePath", filePath);
+}
+
 export class ConversationDB {
   private dbPath: string;
   private db: lancedb.Connection | null = null;
@@ -137,23 +153,21 @@ export class ConversationDB {
     }
   }
 
-  private async saveIndexedFiles(): Promise<void> {
+  private async saveIndexedFile(filePath: string, lastModified: number): Promise<void> {
     if (!this.db) return;
 
-    const records = Array.from(this.indexedFiles.entries()).map(([filePath, lastModified]) => ({
+    const record = {
       filePath,
       lastModified,
-    }));
+    };
 
     const tables = await this.db.tableNames();
     if (tables.includes(METADATA_TABLE)) {
       const metaTable = await this.db.openTable(METADATA_TABLE);
-      await metaTable.delete("true"); // Clear and rewrite
-      if (records.length > 0) {
-        await metaTable.add(records);
-      }
-    } else if (records.length > 0) {
-      await this.db.createTable(METADATA_TABLE, records);
+      await metaTable.delete(buildMetadataFileDeleteFilter(filePath));
+      await metaTable.add([record]);
+    } else {
+      await this.db.createTable(METADATA_TABLE, [record]);
     }
 
     this.writesSinceCompaction++;
@@ -234,6 +248,7 @@ export class ConversationDB {
           // Save mtime so we don't reprocess this file every startup
           const postStat = await fs.promises.stat(filePath);
           this.indexedFiles.set(filePath, postStat.mtimeMs);
+          await this.saveIndexedFile(filePath, postStat.mtimeMs);
           processed++;
           continue;
         }
@@ -243,6 +258,7 @@ export class ConversationDB {
           // Save mtime so we don't reprocess this file every startup
           const postStat = await fs.promises.stat(filePath);
           this.indexedFiles.set(filePath, postStat.mtimeMs);
+          await this.saveIndexedFile(filePath, postStat.mtimeMs);
           processed++;
           continue;
         }
@@ -262,7 +278,7 @@ export class ConversationDB {
         const tables = await this.db.tableNames();
         if (tables.includes(TABLE_NAME)) {
           // Delete existing chunks from this session before adding new ones
-          await this.table!.delete(`"sessionId" = '${conversation.sessionId}'`);
+          await this.table!.delete(buildSessionDeleteFilter(conversation.sessionId));
           await this.table!.add(records);
         } else {
           this.table = await this.db.createTable(TABLE_NAME, records);
@@ -272,7 +288,7 @@ export class ConversationDB {
         // if the file was modified during embedding
         const postStat = await fs.promises.stat(filePath);
         this.indexedFiles.set(filePath, postStat.mtimeMs);
-        await this.saveIndexedFiles();
+        await this.saveIndexedFile(filePath, postStat.mtimeMs);
 
         processed++;
         added += records.length;
@@ -285,9 +301,6 @@ export class ConversationDB {
         this.indexingInProgress.delete(filePath);
       }
     }
-
-    // Save metadata for any empty/null files that were skipped
-    await this.saveIndexedFiles();
 
     // Compact after bulk indexing
     await this.maybeCompact();
@@ -323,6 +336,7 @@ export class ConversationDB {
         // Save mtime so watcher doesn't retry this file
         const postStat = await fs.promises.stat(filePath);
         this.indexedFiles.set(filePath, postStat.mtimeMs);
+        await this.saveIndexedFile(filePath, postStat.mtimeMs);
         return { processed: 1, added: 0 };
       }
 
@@ -331,6 +345,7 @@ export class ConversationDB {
         // Save mtime so watcher doesn't retry this file
         const postStat = await fs.promises.stat(filePath);
         this.indexedFiles.set(filePath, postStat.mtimeMs);
+        await this.saveIndexedFile(filePath, postStat.mtimeMs);
         return { processed: 1, added: 0 };
       }
 
@@ -345,7 +360,7 @@ export class ConversationDB {
       const tables = await this.db.tableNames();
       if (tables.includes(TABLE_NAME)) {
         // Delete existing chunks from this session
-        await this.table!.delete(`"sessionId" = '${conversation.sessionId}'`);
+        await this.table!.delete(buildSessionDeleteFilter(conversation.sessionId));
         await this.table!.add(records);
       } else {
         this.table = await this.db.createTable(TABLE_NAME, records);
@@ -354,7 +369,7 @@ export class ConversationDB {
       // Save the CURRENT mtime to avoid re-indexing if file was modified during embedding
       const postStat = await fs.promises.stat(filePath);
       this.indexedFiles.set(filePath, postStat.mtimeMs);
-      await this.saveIndexedFiles();
+      await this.saveIndexedFile(filePath, postStat.mtimeMs);
 
       return { processed: 1, added: records.length };
     } catch (error) {
@@ -424,11 +439,20 @@ export class ConversationDB {
       };
     }
 
-    const rows = await this.table.query().toArray();
-    const projects = new Set(rows.map((r) => r.project as string));
+    const totalChunks = await this.table.countRows();
 
+    const projectRows = await this.table
+      .query()
+      .select(["project"])
+      .toArray();
+    const projects = new Set(projectRows.map((r) => r.project as string));
+
+    const timestampRows = await this.table
+      .query()
+      .select(["timestamp"])
+      .toArray();
     let lastUpdated: string | null = null;
-    for (const row of rows) {
+    for (const row of timestampRows) {
       const ts = row.timestamp as string;
       if (!lastUpdated || ts > lastUpdated) {
         lastUpdated = ts;
@@ -436,7 +460,7 @@ export class ConversationDB {
     }
 
     return {
-      totalChunks: rows.length,
+      totalChunks,
       projects: projects.size,
       lastUpdated,
     };

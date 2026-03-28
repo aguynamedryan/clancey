@@ -20,6 +20,13 @@ function isProcessAlive(pid: number): boolean {
  * acquired the lock (and should run indexing + watcher). Returns false
  * if another live Clancey instance already holds the lock.
  */
+const onExitCallbacks: Array<() => void> = [];
+
+/** Register a callback to run when the indexer process exits (SIGINT/SIGTERM). */
+export function onIndexerExit(callback: () => void): void {
+  onExitCallbacks.push(callback);
+}
+
 export function tryAcquireIndexerLock(): boolean {
   try {
     fs.mkdirSync(LOCK_DIR, { recursive: true });
@@ -38,12 +45,22 @@ export function tryAcquireIndexerLock(): boolean {
     }
   };
 
+  const registerCleanup = () => {
+    const exitHandler = () => {
+      for (const cb of onExitCallbacks) {
+        try { cb(); } catch {}
+      }
+      cleanup();
+    };
+    process.on("exit", exitHandler);
+    process.on("SIGINT", () => { exitHandler(); process.exit(0); });
+    process.on("SIGTERM", () => { exitHandler(); process.exit(0); });
+  };
+
   const acquire = (): boolean => {
     fs.writeFileSync(LOCK_FILE, `${process.pid}\n`, { flag: "wx" });
     log(`Acquired indexer lock (PID ${process.pid})`);
-    process.on("exit", cleanup);
-    process.on("SIGINT", () => { cleanup(); process.exit(0); });
-    process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+    registerCleanup();
     return true;
   };
 
@@ -64,8 +81,27 @@ export function tryAcquireIndexerLock(): boolean {
         return false;
       }
       log(`Removing stale lock from PID ${pid}`);
-      fs.unlinkSync(LOCK_FILE);
-      return acquire();
+      // Atomically replace the lock file to avoid TOCTOU race:
+      // 1. Write our PID to a temp file
+      // 2. Rename it over the lock (atomic on POSIX)
+      // 3. Wait briefly for any concurrent racers to finish their renames
+      // 4. Re-read — the last rename wins, so only one PID survives
+      const tmpFile = `${LOCK_FILE}.${process.pid}`;
+      fs.writeFileSync(tmpFile, `${process.pid}\n`);
+      fs.renameSync(tmpFile, LOCK_FILE);
+
+      // Allow other racing renames to settle
+      const start = Date.now();
+      while (Date.now() - start < 50) {}
+
+      const winner = parseInt(fs.readFileSync(LOCK_FILE, "utf-8").trim(), 10);
+      if (winner !== process.pid) {
+        log(`Lost lock race to PID ${winner}. This instance will be search-only.`);
+        return false;
+      }
+      log(`Acquired indexer lock (PID ${process.pid})`);
+      registerCleanup();
+      return true;
     } catch (staleLockError) {
       log(`Failed to recover stale lock file: ${staleLockError}`);
       return false;

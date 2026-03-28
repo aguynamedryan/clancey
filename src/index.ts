@@ -6,13 +6,15 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { ConversationDB } from "./db.js";
 import { ConversationWatcher } from "./watcher.js";
-import { tryAcquireIndexerLock } from "./lock.js";
+import { getIndexerOwnershipError } from "./indexer-ownership.js";
+import { tryAcquireIndexerLock, onIndexerExit } from "./lock.js";
 import { log, logError, LOG_FILE } from "./logger.js";
 import path from "path";
 import os from "os";
 import fs from "fs";
 
 const db = new ConversationDB(path.join(os.homedir(), ".clancey", "conversations.lance"));
+let isIndexerInstance = false;
 
 function getServerVersion(): string {
   try {
@@ -157,6 +159,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "index_conversations": {
       const force = (args?.force as boolean) || false;
+      const ownershipError = getIndexerOwnershipError(isIndexerInstance);
+
+      if (ownershipError) {
+        return {
+          content: [{ type: "text", text: ownershipError }],
+          isError: true,
+        };
+      }
 
       try {
         const stats = await db.indexAll(force);
@@ -224,12 +234,13 @@ async function main() {
 
   // Only one instance should do indexing and file watching.
   // Other instances are search-only (they read from the shared LanceDB on disk).
-  const isIndexer = tryAcquireIndexerLock();
+  isIndexerInstance = tryAcquireIndexerLock();
 
-  if (isIndexer) {
+  if (isIndexerInstance) {
     // Do initial index in background (don't block the server)
     // Start the watcher AFTER initial indexing to avoid races
     const watcher = new ConversationWatcher(db);
+    onIndexerExit(() => watcher.stop());
 
     log("Starting background indexing...");
     db.indexAll(false)

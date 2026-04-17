@@ -198,7 +198,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: `Index status:\n- Total chunks: ${status.totalChunks}\n- Projects indexed: ${status.projects}\n- Last updated: ${status.lastUpdated || "Never"}`,
+              text: `Index status:\n- Indexing: ${status.isIndexing ? "in progress" : "idle"}\n- Total chunks: ${status.totalChunks}\n- Projects indexed: ${status.projects}\n- Last updated: ${status.lastUpdated || "Never"}`,
             },
           ],
         };

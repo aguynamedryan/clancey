@@ -81,6 +81,7 @@ interface IndexStatus {
   totalChunks: number;
   projects: number;
   lastUpdated: string | null;
+  isIndexing: boolean;
 }
 
 interface IndexStats {
@@ -486,6 +487,7 @@ export class ConversationDB {
       totalChunks,
       projects: projects.size,
       lastUpdated,
+      isIndexing: this.indexAllInProgress,
     };
   }
 }

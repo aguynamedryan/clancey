@@ -35,6 +35,7 @@ describe("getStatus", () => {
       totalChunks: 0,
       projects: 0,
       lastUpdated: null,
+      isIndexing: false,
     });
   });
 
